@@ -696,6 +696,101 @@ async function hybridSearchTurns(db, query, { project, limit = 30, files }) {
   return threads.slice(0, limit);
 }
 
+// ── Raw Turn Search (resolution 0) ──────────────────────────────────────────
+
+async function hybridSearchRawTurns(db, query, { project, limit = 10, files }) {
+  const queryEmbedding = await generateQueryEmbedding(query);
+
+  // BM25 on turns_fts
+  let bm25Results = [];
+  try {
+    const ftsQuery = sanitizeFtsQuery(query);
+    if (ftsQuery) {
+      let sql = `
+        SELECT t.*, th.project, th.project_name, th.timestamp_start, rank
+        FROM turns_fts
+        JOIN turns t ON turns_fts.rowid = t.id
+        JOIN threads th ON t.thread_id = th.id
+        WHERE turns_fts MATCH ?
+      `;
+      const params = [ftsQuery];
+      if (project && project !== '*') {
+        sql += " AND (th.project = ?)";
+        params.push(project);
+      }
+      sql += " ORDER BY rank LIMIT 30";
+      bm25Results = db.prepare(sql).all(...params);
+    }
+  } catch (err) {
+    console.error(`[memory] Raw turn BM25 error: ${err.message}`);
+  }
+
+  // Vector KNN on turn_embeddings
+  let vectorResults = [];
+  if (queryEmbedding) {
+    try {
+      const buf = serializeEmbedding(queryEmbedding);
+      const knnRows = db.prepare(`
+        SELECT turn_id, distance
+        FROM turn_embeddings
+        WHERE embedding MATCH ?
+        ORDER BY distance
+        LIMIT 30
+      `).all(buf);
+
+      if (knnRows.length > 0) {
+        const ids = knnRows.map(r => r.turn_id);
+        const placeholders = ids.map(() => "?").join(",");
+        let sql = `
+          SELECT t.*, th.project, th.project_name, th.timestamp_start
+          FROM turns t JOIN threads th ON t.thread_id = th.id
+          WHERE t.id IN (${placeholders})
+        `;
+        const params = [...ids];
+        if (project && project !== '*') {
+          sql += " AND th.project = ?";
+          params.push(project);
+        }
+
+        const turnMap = new Map();
+        for (const t of db.prepare(sql).all(...params)) {
+          turnMap.set(t.id, t);
+        }
+
+        vectorResults = knnRows
+          .filter(r => turnMap.has(r.turn_id))
+          .map(r => ({ ...turnMap.get(r.turn_id), distance: r.distance }));
+      }
+    } catch (err) {
+      console.error(`[memory] Raw turn vector error: ${err.message}`);
+    }
+  }
+
+  // RRF merge - individual turns, no thread grouping
+  const scoreMap = new Map();
+  const K = 15;
+
+  for (let i = 0; i < bm25Results.length; i++) {
+    const r = bm25Results[i];
+    scoreMap.set(r.id, { ...r, rrf: 1.0 / (K + i + 1) });
+  }
+  for (let i = 0; i < vectorResults.length; i++) {
+    const r = vectorResults[i];
+    const existing = scoreMap.get(r.id);
+    const score = 1.0 / (K + i + 1);
+    if (existing) {
+      existing.rrf += score;
+    } else {
+      scoreMap.set(r.id, { ...r, rrf: score });
+    }
+  }
+
+  const results = [...scoreMap.values()];
+  results.sort((a, b) => b.rrf - a.rrf);
+
+  return results.slice(0, limit);
+}
+
 // ── Resolve Project Directory from Hash ──────────────────────────────────────
 
 function resolveProjectDir(projectHash) {
@@ -747,6 +842,18 @@ function formatResolution3(atoms) {
     line += ` ${a.content}`;
     return line;
   }).join("\n");
+}
+
+function formatResolution0(turns) {
+  // Raw individual turns view
+  return turns.map(t => {
+    const date = t.timestamp || t.timestamp_start || "unknown";
+    const projectLabel = t.project_name || t.project || "unknown";
+    let line = `[Turn #${t.turn_number}] (thread:${t.thread_id}, project:${projectLabel}, ${date})`;
+    if (t.user_content) line += `\n  [user] ${truncate(t.user_content, 250)}`;
+    if (t.assistant_content) line += `\n  [assistant] ${truncate(t.assistant_content, 250)}`;
+    return line;
+  }).join("\n\n");
 }
 
 function formatResolution2(db, threads) {
@@ -921,10 +1028,10 @@ const server = new McpServer({
 
 server.tool(
   "recall_context",
-  "Hybrid BM25+vector search. Supports OR operator and \"quoted phrases\". resolution: 3=atoms, 2=exchanges, 1=full threads.",
+  "Hybrid BM25+vector search. Supports OR operator and \"quoted phrases\". resolution: 0=raw turns, 3=atoms, 2=exchanges, 1=full threads.",
   {
     query: z.string().describe("Search topic or question"),
-    resolution: z.number().optional().default(3).describe("3=atoms, 2=exchanges, 1=threads"),
+    resolution: z.number().optional().default(3).describe("0=raw turns, 3=atoms, 2=exchanges, 1=threads"),
     project: z.string().optional().describe("Project filter ('*' for all)"),
     type: z.string().optional().describe("Knowledge type filter"),
     limit: z.number().optional().default(5).describe("Max results (default 5)"),
@@ -1026,7 +1133,24 @@ server.tool(
         };
       }
 
-      return { content: [{ type: "text", text: "Invalid resolution. Use 1, 2, or 3." }] };
+      if (res === 0) {
+        // Raw turn search - individual turns, not grouped by thread
+        const turns = await hybridSearchRawTurns(db, query, { project, limit: limit || 10, files });
+
+        if (turns.length === 0) {
+          return { content: [{ type: "text", text: `No raw turns found for: "${query}"` }] };
+        }
+
+        const formatted = formatResolution0(turns);
+        return {
+          content: [{
+            type: "text",
+            text: `Found ${turns.length} raw turns for "${query}":\n\n${formatted}`
+          }]
+        };
+      }
+
+      return { content: [{ type: "text", text: "Invalid resolution. Use 0, 1, 2, or 3." }] };
     } catch (err) {
       return { content: [{ type: "text", text: `Search error: ${err.message}` }], isError: true };
     }
@@ -1338,32 +1462,7 @@ server.tool(
       }
 
       if (action === "reextract") {
-        // thread_id "all" re-extracts every thread; otherwise a specific thread
-        if (!thread_id) return { content: [{ type: "text", text: "thread_id required for reextract. Use 'all' to re-extract all threads." }] };
-
-        if (thread_id === "all") {
-          const threads = db.prepare("SELECT id, source_file, project, project_name FROM threads WHERE source_file IS NOT NULL").all();
-          let queued = 0;
-          for (const t of threads) {
-            if (!t.source_file) continue;
-            db.prepare(`
-              INSERT INTO jobs (type, payload, priority, created_at)
-              VALUES ('ingest_thread', json_object('transcript_path', ?, 'project', ?, 'project_name', ?, 'force_extract', json('true')), 3, datetime('now'))
-            `).run(t.source_file, t.project, t.project_name);
-            queued++;
-          }
-          return { content: [{ type: "text", text: `Queued re-extraction for ${queued} threads.` }] };
-        }
-
-        const thread = db.prepare("SELECT * FROM threads WHERE id = ?").get(thread_id);
-        if (!thread) return { content: [{ type: "text", text: `Thread ${thread_id} not found.` }] };
-
-        db.prepare(`
-          INSERT INTO jobs (type, payload, priority, created_at)
-          VALUES ('ingest_thread', json_object('transcript_path', ?, 'project', ?, 'project_name', ?, 'force_extract', json('true')), 5, datetime('now'))
-        `).run(thread.source_file, thread.project, thread.project_name);
-
-        return { content: [{ type: "text", text: `Queued re-extraction for thread ${thread_id} from ${thread.source_file}` }] };
+        return { content: [{ type: "text", text: "Re-extraction is permanently disabled. Atoms are user-approved only via save_knowledge." }] };
       }
 
       if (action === "archive_project") {
