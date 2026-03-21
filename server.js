@@ -964,9 +964,9 @@ function truncate(text, maxLen) {
 function cosineDedup(db, content, embedding) {
   // Exact content match first
   const exact = db.prepare(
-    "SELECT id FROM knowledge WHERE content = ? AND status = 'active' LIMIT 1"
+    "SELECT id, content FROM knowledge WHERE content = ? AND status = 'active' LIMIT 1"
   ).get(content);
-  if (exact) return { action: "reinforce", existingId: exact.id, distance: 0.0 };
+  if (exact) return { action: "reinforce", existingId: exact.id, distance: 0.0, existingContent: exact.content };
 
   // Cosine via embeddings
   let nearest = null;
