@@ -966,9 +966,10 @@ function cosineDedup(db, content, embedding) {
   const exact = db.prepare(
     "SELECT id FROM knowledge WHERE content = ? AND status = 'active' LIMIT 1"
   ).get(content);
-  if (exact) return { action: "reinforce", existingId: exact.id };
+  if (exact) return { action: "reinforce", existingId: exact.id, distance: 0.0 };
 
   // Cosine via embeddings
+  let nearest = null;
   if (embedding) {
     try {
       const buf = serializeEmbedding(embedding);
@@ -981,12 +982,15 @@ function cosineDedup(db, content, embedding) {
       `).all(buf);
 
       for (const s of similar) {
-        if (s.distance < 0.20) {
-          // Only reinforce active atoms - archived/superseded ones are dead
-          const active = db.prepare(
-            "SELECT id FROM knowledge WHERE id = ? AND status = 'active'"
-          ).get(s.atom_id);
-          if (active) return { action: "reinforce", existingId: s.atom_id };
+        // Track nearest active atom for reporting
+        const active = db.prepare(
+          "SELECT id, content FROM knowledge WHERE id = ? AND status = 'active'"
+        ).get(s.atom_id);
+        if (active) {
+          if (!nearest) nearest = { id: active.id, content: active.content, distance: s.distance };
+          if (s.distance < 0.20) {
+            return { action: "reinforce", existingId: s.atom_id, distance: s.distance, existingContent: active.content };
+          }
         }
       }
     } catch {
@@ -994,7 +998,7 @@ function cosineDedup(db, content, embedding) {
     }
   }
 
-  return { action: "create" };
+  return { action: "create", nearest };
 }
 
 // ── Access Count Session Cap ────────────────────────────────────────────────
@@ -1190,6 +1194,7 @@ server.tool(
       const dedup = cosineDedup(db, content, embedding);
 
       if (dedup.action === "reinforce") {
+        const before = db.prepare("SELECT confidence FROM knowledge WHERE id = ?").get(dedup.existingId);
         db.prepare(`
           UPDATE knowledge SET
             reinforcement_count = reinforcement_count + 1,
@@ -1198,8 +1203,11 @@ server.tool(
             updated_at = datetime('now')
           WHERE id = ?
         `).run(dedup.existingId);
+        const after = db.prepare("SELECT confidence FROM knowledge WHERE id = ?").get(dedup.existingId);
+        const existingSnippet = dedup.existingContent ? truncate(dedup.existingContent, 120) : "";
+        const sim = dedup.distance != null ? (1 - dedup.distance).toFixed(2) : "exact";
         return {
-          content: [{ type: "text", text: `Knowledge reinforced. Atom #${dedup.existingId} (duplicate detected, confidence boosted).` }]
+          content: [{ type: "text", text: `Reinforced atom #${dedup.existingId} (similarity: ${sim}). Existing: "${existingSnippet}" Confidence: ${before?.confidence?.toFixed(2) || "?"} -> ${after?.confidence?.toFixed(2) || "?"}.` }]
         };
       }
 
@@ -1239,8 +1247,11 @@ server.tool(
         }
       }
 
+      const nearestInfo = dedup.nearest
+        ? ` Nearest: #${dedup.nearest.id} (similarity: ${(1 - dedup.nearest.distance).toFixed(2)}) "${truncate(dedup.nearest.content, 80)}"`
+        : "";
       return {
-        content: [{ type: "text", text: `Knowledge saved. Atom #${newId} [${type}] (${detectedScope})` }]
+        content: [{ type: "text", text: `Saved atom #${newId} [${type}] (${detectedScope}).${nearestInfo}` }]
       };
     } catch (err) {
       return { content: [{ type: "text", text: `Save error: ${err.message}` }], isError: true };
