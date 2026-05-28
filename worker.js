@@ -7,9 +7,19 @@ import {
 } from "fs";
 import { join, basename } from "path";
 import { homedir } from "os";
+import { pathToFileURL } from "url";
 import { createHash } from "crypto";
 import { createInterface } from "readline";
 import { execFile, execSync } from "child_process";
+import { parseTranscript, generateSourceThreadId } from "./transcript-parser.js";
+import {
+  ensureCanonicalSchema,
+  getActiveCanonicalThread,
+  getCanonicalThreadForSource,
+  getThreadBySourceFile,
+  setActiveCanonicalThread,
+  sourceKindFromPath,
+} from "./memory-schema.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -150,6 +160,14 @@ function countToolUseBlocks(message) {
   return c.filter(b => b.type === "tool_use").length;
 }
 
+function extractToolUses(message) {
+  const c = message?.content;
+  if (!Array.isArray(c)) return [];
+  return c
+    .filter(b => b.type === "tool_use")
+    .map(b => ({ name: b.name || "unknown", input: JSON.stringify(b.input || {}) }));
+}
+
 function hasErrorInToolResults(messages, startIdx) {
   // Look ahead for the next user message containing tool_result blocks
   for (let i = startIdx + 1; i < messages.length; i++) {
@@ -179,6 +197,7 @@ function pairIntoTurns(rawMessages) {
     if (m.type === "user") {
       textMessages.push({
         role: "user",
+        uuid: m.uuid,
         content: extractTextContent(m.message),
         timestamp: m.timestamp,
       });
@@ -187,10 +206,12 @@ function pairIntoTurns(rawMessages) {
       const hasError = hasErrorInToolResults(rawMessages, i);
       textMessages.push({
         role: "assistant",
+        uuid: m.uuid,
         content: extractTextContent(m.message),
         timestamp: m.timestamp,
         toolCalls,
         hasError,
+        toolUses: extractToolUses(m.message),
       });
     }
   }
@@ -204,21 +225,26 @@ function pairIntoTurns(rawMessages) {
 
     if (textMessages[i].role === "user") {
       turn.user_content = textMessages[i].content;
+      turn.user_uuid = textMessages[i].uuid;
       turn.timestamp = textMessages[i].timestamp;
       i++;
       // Collect assistant response(s) for this turn
       if (i < textMessages.length && textMessages[i].role === "assistant") {
         turn.assistant_content = textMessages[i].content;
+        turn.assistant_uuid = textMessages[i].uuid;
         turn.tool_calls_count = textMessages[i].toolCalls || 0;
         turn.has_error = textMessages[i].hasError ? 1 : 0;
+        turn.tool_uses = textMessages[i].toolUses || [];
         if (!turn.timestamp) turn.timestamp = textMessages[i].timestamp;
         i++;
       }
     } else if (textMessages[i].role === "assistant") {
       // Assistant without preceding user (rare)
       turn.assistant_content = textMessages[i].content;
+      turn.assistant_uuid = textMessages[i].uuid;
       turn.tool_calls_count = textMessages[i].toolCalls || 0;
       turn.has_error = textMessages[i].hasError ? 1 : 0;
+      turn.tool_uses = textMessages[i].toolUses || [];
       turn.timestamp = textMessages[i].timestamp;
       i++;
     }
@@ -247,9 +273,18 @@ function generateThreadId(turns, filePath) {
 
 // ── OpenAI Embeddings ───────────────────────────────────────────────────────
 
+// SQLITE_ONLY disables all OpenAI embedding calls. Turn embeddings, atom
+// embeddings, consolidation re-embeds, and failed-embedding retries are all
+// skipped. Turn/thread storage and FTS continue to run.
+// Evaluated lazily: loadEnv() runs inside main(), after this module is parsed.
+function isSqliteOnly() {
+  return (process.env.SQLITE_ONLY || "").toLowerCase() === "true";
+}
+
 let openai = null;
 
 function getOpenAI() {
+  if (isSqliteOnly()) return null;
   if (!openai) {
     openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   }
@@ -257,6 +292,9 @@ function getOpenAI() {
 }
 
 async function generateEmbeddings(texts) {
+  if (isSqliteOnly()) {
+    throw new Error("SQLITE_ONLY mode: embeddings disabled");
+  }
   const client = getOpenAI();
   // text-embedding-3-small has 8192 token limit; ~4 chars per token, cap at 30000 chars
   const truncated = texts.map(t => t.length > 30000 ? t.slice(0, 30000) : t);
@@ -370,6 +408,7 @@ function openDatabase() {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
+  ensureCanonicalSchema(db);
   return db;
 }
 
@@ -448,15 +487,20 @@ function deduplicateAtom(db, content, type, embedding) {
 // ── Ingest Thread Pipeline ──────────────────────────────────────────────────
 
 async function ingestThread(db, filePath, project, projectName, isFullSession, gitCommitHash, gitProjectDir, forceExtract = false) {
-  // Step 1: Parse JSONL
-  const rawMessages = await parseJSONL(filePath);
+  const parsed = await parseTranscript(filePath);
+  const rawMessages = parsed.rawMessages || [];
+  const sourceKind = parsed.sourceKind === "unknown" ? sourceKindFromPath(filePath) : parsed.sourceKind;
+  const sourceSessionId = parsed.sourceSessionId || null;
+
   if (rawMessages.length === 0) {
     log("  Empty transcript, skipping.");
     return 0;
   }
 
-  // Step 2: Pair into turns
-  const turns = pairIntoTurns(rawMessages);
+  const turns = parsed.turns || [];
+  if (sourceKind === "codex" && turns.length === 0) {
+    throw new Error("Codex transcript recognized but no user or assistant turns were parsed");
+  }
   if (turns.length === 0) {
     log("  No turns found, skipping.");
     return 0;
@@ -471,66 +515,174 @@ async function ingestThread(db, filePath, project, projectName, isFullSession, g
     }
   }
 
-  // Step 3: Create thread record
-  const threadId = generateThreadId(turns, filePath);
+  const sourceThread = getCanonicalThreadForSource(db, sourceKind, sourceSessionId, filePath)
+    || getThreadBySourceFile(db, filePath);
+  const generatedThreadId = generateSourceThreadId(sourceKind, sourceSessionId, filePath, turns);
+  const threadId = sourceThread?.id || generatedThreadId;
   const fileMtime = statSync(filePath).mtimeMs / 1000;
+  const app = sourceKind === "codex" ? "codex" : "claude";
+  const activeCwd = parsed.cwd || gitProjectDir || null;
+  // Thread identity = the session/terminal, NOT the folder. Each session is its own
+  // thread; resuming a session (same source_session_id) continues the same thread.
+  // Previously the cwd-active pointer glued every session in a folder into one canonical
+  // thread, conflating different clients that share a project folder.
+  const canonicalThreadId = sourceThread?.canonical_thread_id || threadId;
 
   const existingThread = db.prepare("SELECT id, turn_count FROM threads WHERE id = ?").get(threadId);
 
   if (existingThread) {
-    // Update thread metadata if this is a full session re-ingestion
-    if (isFullSession && turns.length > existingThread.turn_count) {
+    if (turns.length > existingThread.turn_count) {
       db.prepare(`
         UPDATE threads SET
           turn_count = ?,
           timestamp_end = ?,
           file_mtime = ?,
-          source_file = ?
+          source_file = ?,
+          source_kind = ?,
+          source_session_id = ?,
+          canonical_thread_id = ?
         WHERE id = ?
-      `).run(turns.length, turns[turns.length - 1].timestamp, fileMtime, filePath, threadId);
+      `).run(
+        turns.length,
+        turns[turns.length - 1].timestamp,
+        fileMtime,
+        filePath,
+        sourceKind,
+        sourceSessionId,
+        canonicalThreadId,
+        threadId
+      );
       log(`  Updated thread ${threadId}: ${existingThread.turn_count} -> ${turns.length} turns`);
     } else if (forceExtract) {
       log(`  Force re-extraction for thread ${threadId} (${existingThread.turn_count} turns)`);
     } else {
-      log(`  Thread ${threadId} already exists with ${existingThread.turn_count} turns, skipping.`);
-      return 0;
+      db.prepare(`
+        UPDATE threads SET
+          source_kind = ?,
+          source_session_id = ?,
+          canonical_thread_id = ?,
+          source_file = ?,
+          file_mtime = ?
+        WHERE id = ?
+      `).run(sourceKind, sourceSessionId, canonicalThreadId, filePath, fileMtime, threadId);
+      log(`  Thread ${threadId} already exists with ${existingThread.turn_count} turns, checking turns.`);
     }
   } else {
     db.prepare(`
-      INSERT OR IGNORE INTO threads (id, project, project_name, turn_count, timestamp_start, timestamp_end, source_file, file_mtime)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO threads
+        (id, project, project_name, turn_count, timestamp_start, timestamp_end, source_file, file_mtime, source_kind, source_session_id, canonical_thread_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       threadId, project, projectName, turns.length,
       turns[0].timestamp, turns[turns.length - 1].timestamp,
-      filePath, fileMtime
+      filePath, fileMtime, sourceKind, sourceSessionId, canonicalThreadId
     );
+  }
+
+  if (activeCwd) {
+    setActiveCanonicalThread(db, {
+      app,
+      cwd: activeCwd,
+      canonicalThreadId,
+      savedName: active?.saved_name || null,
+      sourceSessionId,
+    });
+  }
+
+  const insertSummary = db.prepare(`
+    INSERT OR IGNORE INTO summaries (thread_id, leaf_uuid, summary)
+    VALUES (?, ?, ?)
+  `);
+  for (const summary of parsed.summaries || []) {
+    try { insertSummary.run(threadId, summary.leafUuid || null, summary.summary); } catch {}
   }
 
   // Step 4: Store turns
   const insertTurn = db.prepare(`
-    INSERT OR IGNORE INTO turns (thread_id, turn_number, user_content, assistant_content, timestamp, tool_calls_count, has_error)
+    INSERT OR IGNORE INTO turns (thread_id, turn_number, user_content, assistant_content, timestamp, tool_calls_count, has_error, user_uuid, assistant_uuid)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertToolUse = db.prepare(`
+    INSERT OR IGNORE INTO tool_uses (message_uuid, thread_id, turn_id, tool_name, tool_input, timestamp, has_error)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `);
   const storedTurns = [];
   for (const t of turns) {
+    let turnRow;
     try {
       insertTurn.run(threadId, t.turn_number, t.user_content || null, t.assistant_content || null,
-        t.timestamp || null, t.tool_calls_count || 0, t.has_error || 0);
-      const turnRow = db.prepare(
-        "SELECT id FROM turns WHERE thread_id = ? AND turn_number = ?"
+        t.timestamp || null, t.tool_calls_count || 0, t.has_error || 0,
+        t.user_uuid || null, t.assistant_uuid || null);
+      turnRow = db.prepare(
+        "SELECT * FROM turns WHERE thread_id = ? AND turn_number = ?"
       ).get(threadId, t.turn_number);
       if (turnRow) storedTurns.push(turnRow);
     } catch (err) {
-      // UNIQUE constraint violation = already stored, get existing
-      const existing = db.prepare(
-        "SELECT id FROM turns WHERE thread_id = ? AND turn_number = ?"
+      turnRow = db.prepare(
+        "SELECT * FROM turns WHERE thread_id = ? AND turn_number = ?"
       ).get(threadId, t.turn_number);
-      if (existing) storedTurns.push(existing);
+      if (turnRow) storedTurns.push(turnRow);
+    }
+
+    if (turnRow) {
+      const nextUser = t.user_content || null;
+      const nextAssistant = t.assistant_content || null;
+      const nextToolCount = t.tool_calls_count || 0;
+      const nextHasError = t.has_error || 0;
+      const changed =
+        (turnRow.user_content || null) !== nextUser ||
+        (turnRow.assistant_content || null) !== nextAssistant ||
+        (turnRow.tool_calls_count || 0) !== nextToolCount ||
+        (turnRow.has_error || 0) !== nextHasError;
+
+      if (changed) {
+        db.prepare(`
+          UPDATE turns SET
+            user_content = ?,
+            assistant_content = ?,
+            timestamp = COALESCE(?, timestamp),
+            tool_calls_count = ?,
+            has_error = ?,
+            user_uuid = COALESCE(?, user_uuid),
+            assistant_uuid = COALESCE(?, assistant_uuid),
+            embed_status = 'pending'
+          WHERE id = ?
+        `).run(
+          nextUser,
+          nextAssistant,
+          t.timestamp || null,
+          nextToolCount,
+          nextHasError,
+          t.user_uuid || null,
+          t.assistant_uuid || null,
+          turnRow.id
+        );
+        try { db.prepare("DELETE FROM turn_embeddings WHERE turn_id = ?").run(turnRow.id); } catch {}
+      }
+    }
+
+    // MemoryThreads: capture tool_uses extracted from this turn
+    if (t.tool_uses?.length && t.assistant_uuid && turnRow) {
+      for (const tu of t.tool_uses) {
+        try {
+          insertToolUse.run(t.assistant_uuid, threadId, turnRow.id, tu.name, tu.input,
+            t.timestamp || null, t.has_error || 0);
+        } catch {}
+      }
     }
   }
   log(`  Stored ${storedTurns.length} turns for thread ${threadId}`);
 
   // Step 5: Generate turn embeddings (batch)
+  if (isSqliteOnly()) {
+    // Mark all turns as done with no embedding so the retry loop doesn't pick them up.
+    for (const t of storedTurns) {
+      db.prepare("UPDATE turns SET embed_status = 'done' WHERE id = ?").run(t.id);
+    }
+    log(`  Ingestion complete (SQLITE_ONLY): ${storedTurns.length} turns stored for thread ${threadId}.`);
+    return storedTurns.length;
+  }
+
   try {
     // Only embed turns that aren't already done (avoids vec0 UNIQUE constraint on thread updates)
     const alreadyDone = new Set(
@@ -883,6 +1035,15 @@ function runArchiveStale(db) {
 // ── Retry Failed Embeddings ──────────────────────────────────────────────────
 
 async function retryFailedEmbeddings(db) {
+  if (isSqliteOnly()) {
+    // Clear out any lingering pending/failed turns so they stop being retried.
+    const cleared = db.prepare(
+      "UPDATE turns SET embed_status = 'done' WHERE embed_status IN ('failed', 'pending')"
+    ).run().changes;
+    if (cleared > 0) log(`  Marked ${cleared} pending/failed turn(s) as done (SQLITE_ONLY mode)`);
+    return 0;
+  }
+
   // Process up to 5 threads per cycle, handle each turn individually on failure
   const failedThreads = db.prepare(
     "SELECT DISTINCT thread_id FROM turns WHERE embed_status IN ('failed', 'pending') LIMIT 5"
@@ -1125,19 +1286,23 @@ function markPending(db, jobId) {
 async function startup() {
   loadEnv();
 
-  // Validate API keys
-  if (!process.env.OPENAI_API_KEY) {
-    log("FATAL: OPENAI_API_KEY not set. Check .env file.");
-    process.exit(1);
-  }
+  if (isSqliteOnly()) {
+    log("SQLITE_ONLY mode: OpenAI embeddings and new atom writes are disabled.");
+  } else {
+    // Validate API keys
+    if (!process.env.OPENAI_API_KEY) {
+      log("FATAL: OPENAI_API_KEY not set. Check .env file.");
+      process.exit(1);
+    }
 
-  // Test OpenAI connectivity
-  try {
-    await generateEmbeddings(["test"]);
-    log("OpenAI API: OK");
-  } catch (err) {
-    log(`FATAL: OpenAI API test failed: ${err.message}`);
-    process.exit(1);
+    // Test OpenAI connectivity
+    try {
+      await generateEmbeddings(["test"]);
+      log("OpenAI API: OK");
+    } catch (err) {
+      log(`FATAL: OpenAI API test failed: ${err.message}`);
+      process.exit(1);
+    }
   }
 
   // Test Claude CLI
@@ -1249,14 +1414,15 @@ async function pollLoop(db) {
       }
 
       // Scheduled jobs (only check when idle)
-      if (shouldRunConsolidation(db)) {
-        db.prepare("INSERT INTO jobs (type, payload, priority) VALUES ('consolidate', '{}', 2)").run();
-        log("Queued consolidation job");
-      }
-      if (shouldRunArchiveStale(db)) {
-        db.prepare("INSERT INTO jobs (type, payload, priority) VALUES ('archive_stale', '{}', 1)").run();
-        log("Queued archive_stale job");
-      }
+      // DISABLED 2026-04-30: consolidate + archive_stale operate on the now-empty knowledge table
+      // if (shouldRunConsolidation(db)) {
+      //   db.prepare("INSERT INTO jobs (type, payload, priority) VALUES ('consolidate', '{}', 2)").run();
+      //   log("Queued consolidation job");
+      // }
+      // if (shouldRunArchiveStale(db)) {
+      //   db.prepare("INSERT INTO jobs (type, payload, priority) VALUES ('archive_stale', '{}', 1)").run();
+      //   log("Queued archive_stale job");
+      // }
       // Retry failed embeddings periodically
       try {
         await retryFailedEmbeddings(db);
@@ -1289,8 +1455,12 @@ process.on("SIGINT", () => {
 
 // ── Entry Point ─────────────────────────────────────────────────────────────
 
-startup().then(db => pollLoop(db)).catch(err => {
-  log(`Fatal error: ${err.message}`);
-  try { unlinkSync(PID_FILE); } catch { /* ignore */ }
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startup().then(db => pollLoop(db)).catch(err => {
+    log(`Fatal error: ${err.message}`);
+    try { unlinkSync(PID_FILE); } catch { /* ignore */ }
+    process.exit(1);
+  });
+}
+
+export { ingestThread, openDatabase };

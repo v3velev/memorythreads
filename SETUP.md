@@ -93,6 +93,10 @@ node ~/.claude/memory-server/migrations/006-gating-and-git.cjs
 node ~/.claude/memory-server/migrations/007-schema-fix.cjs
 ```
 
+```bash
+node ~/.claude/memory-server/migrations/008-canonical-memorythreads.cjs
+```
+
 Verify: `sqlite3 ~/.claude/memory-server/data/memory.db ".tables"` should show ~40 tables (including FTS virtual tables). If any migration printed errors, delete the database and re-run all migrations from 001.
 
 ## 4. Register MCP Server
@@ -246,15 +250,82 @@ cat ~/.claude/memory-server/logs/watchdog-stdout.log
 
 **Linux alternative:** Use a systemd user service or cron job that runs `~/.claude/memory-server/watchdog.sh` every 5 minutes.
 
-## 7. Global CLAUDE.md Setup
+## 7. Incremental Sync (File-System Watcher)
 
-Add the following to `~/.claude/CLAUDE.md` so memory slash commands work in all sessions:
+The incremental sync script watches `~/.claude/projects/` for JSONL file changes and inserts new turns into the database in near-real-time. This means open sessions are searchable from other sessions without waiting for compaction or session end.
+
+Create `~/Library/LaunchAgents/com.claude.memory-sync.plist` with the content below. Replace `HOMEDIR` with your actual home directory path and `NODEPATH` with the output of `which node`.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claude.memory-sync</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>NODEPATH</string>
+        <string>HOMEDIR/.claude/memory-server/incremental-sync.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>HOMEDIR/.claude/memory-server</string>
+    <key>WatchPaths</key>
+    <array>
+        <string>HOMEDIR/.claude/projects</string>
+    </array>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>HOMEDIR/.claude/memory-server/logs/sync-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>HOMEDIR/.claude/memory-server/logs/sync-stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+```
+
+Load the sync agent:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.claude.memory-sync.plist
+```
+
+Verify: `launchctl list | grep claude` should show both `com.claude.memory-sync` and `com.claude.memory-watchdog`.
+
+**How it works:**
+- launchd `WatchPaths` triggers `incremental-sync.js` whenever any file changes under `~/.claude/projects/`
+- 30-second throttle prevents rapid re-firing
+- Tracks sync state in `data/sync-state.json` (file path -> last mtime + turn count)
+- Only processes new turns since last sync (incremental, not full re-parse)
+- Inserts turns with `embed_status='pending'` - the worker generates embeddings asynchronously
+- FTS entries auto-populated by existing `turns_fts_ai` trigger
+- Dedup: `INSERT OR IGNORE` with `UNIQUE(thread_id, turn_number)` prevents duplicates when pre-compact.sh or stop.sh later ingests the same session
+
+**Linux alternative:** Use a systemd path unit watching `~/.claude/projects` that triggers the sync script.
+
+## 8. Global CLAUDE.md Setup
+
+Add the following to `~/.claude/CLAUDE.md` so memory slash commands and the user-approved atom workflow work in all sessions:
 
 ```markdown
 ## Memory
 - Before asking the user to re-explain something, call recall_context first
-- When making a significant decision or learning a user preference, call save_knowledge with rationale
 - If retrieved knowledge seems wrong or outdated, call memory_manage(action='feedback') with the correction
+- Auto-extraction is DISABLED. Do NOT call save_knowledge without user approval.
+- When you identify something worth remembering (a user preference, a decision, a correction, a behavioral pattern), append it to the END of your response like this:
+  ---
+  Memory: [brief description of what to save]
+  Type: [preference/decision/correction/insight]
+  Save? (y/n)
+- Only propose saving things that are DURABLE (won't be stale in 2 weeks), NOT derivable from code, and would CHANGE future behavior. Do not propose saving in-progress decisions, architecture choices that might change, or facts about current implementation state.
+- When the user approves, call save_knowledge with the content.
 
 ## Memory Commands
 - /primeDB: Call recall_context(resolution=3) for atom overview. Summarize findings.
@@ -269,15 +340,19 @@ Add the following to `~/.claude/CLAUDE.md` so memory slash commands work in all 
   Confirm before calling memory_manage(action='delete') on each.
 ```
 
-## 8. Verification Checklist
+## 9. Verification Checklist
 
 Run each of these to confirm everything works:
 
 - [ ] `sqlite3 ~/.claude/memory-server/data/memory.db ".tables"` - shows tables
 - [ ] `claude mcp get memory` - returns server config
 - [ ] `cat ~/.claude/memory-server/worker.pid && ps -p $(cat ~/.claude/memory-server/worker.pid)` - worker running
+- [ ] `launchctl list | grep claude` - shows both `memory-watchdog` and `memory-sync`
 - [ ] Start a new Claude Code session - you should see a memory status message on startup
+- [ ] Send a short message (e.g., "hi") - you should see the static memory reminder
 - [ ] Ask Claude to run `recall_context` - the MCP tool should respond
+- [ ] Run `recall_context(query="test", resolution=0)` - should return raw individual turns
+- [ ] Check `data/sync-state.json` exists after first sync run
 
 ## Troubleshooting
 
@@ -290,4 +365,8 @@ Run each of these to confirm everything works:
 | MCP tools not available | `claude mcp add --scope user memory node ~/.claude/memory-server/server.js` |
 | Worker crashes: "Claude CLI not found" | Set `CLAUDE_CLI_PATH=$(which claude)` in `.env` |
 | launchd not starting watchdog | Check paths in plist are absolute (no `$HOME`), run `launchctl list | grep memory` |
+| Incremental sync not running | Check `logs/sync.log` and `logs/sync-stderr.log`. Verify plist loaded: `launchctl list | grep sync` |
+| Sync finds 0 new turns | Check `data/sync-state.json` - if mtimes are current, files haven't changed since last sync |
+| resolution=0 returns atoms instead | MCP server needs restart (loaded at session start). Start a new session. |
 | Migrations fail | Ensure `data/` directory exists, check Node.js version. If partially applied, delete `data/memory.db` and re-run all from 001 |
+| Want to re-enable auto-extraction | In `worker.js`, change `SKIP_AUTO_EXTRACTION = true` to `false` (line ~848). Also un-comment the hindsight extraction queue in `handleJob` (line ~1974). |

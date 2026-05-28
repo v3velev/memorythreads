@@ -44,6 +44,25 @@ The definitive blueprint for the memory system rebuild. Every detail needed to i
 | Phase 4: Advanced | COMPLETED | 2026-03-07 | See Phase 4 notes below. |
 | Phase 4b: Architectural | COMPLETED | 2026-03-08 | Transcript truncation, tool consolidation (5->3), injection cache. See Phase 4b notes below. |
 | Phase 5: Atom Quality | COMPLETED | 2026-03-09 | Extraction rewrite (4 gates, prescriptive format), Haiku validator, intent-based injection. See Phase 5 notes below. |
+| Phase 6: User-Approved Mode | COMPLETED | 2026-03-16 | Auto-extraction disabled, user-approved atoms only, file-system watcher, resolution 0, compaction improvements. See Phase 6 notes below. |
+
+### Phase 6 Implementation Notes (2026-03-16)
+
+Motivated by analysis of competing system (Claude Code Permanent Memory v2) and investigation of 18 unresolved repeat events that revealed auto-extraction was saving bad atoms (in-progress decisions, reversed architecture choices).
+
+**35. Auto-extraction disabled** - `worker.js` `ingestThread()` now returns after Step 5 (turn storage + embeddings). Steps 5.5-7.1 (LLM extraction, validation, atom storage) are skipped via `SKIP_AUTO_EXTRACTION = true` flag at line ~848. Hindsight extraction also disabled (`if (false && ...)` at line ~1974). Turns and embeddings still fully functional for `recall_context` search.
+
+**36. User-approved atom workflow** - `~/.claude/CLAUDE.md` updated. Claude proposes atoms at the end of responses with type and description. User approves with `y` before `save_knowledge` is called. Prevents bad atoms from being saved without human review.
+
+**37. Resolution 0 (raw turn search)** - `server.js` new `hybridSearchRawTurns()` function and `formatResolution0()` formatter. Returns individual turns ranked by BM25+vector (not grouped by thread like resolution 2). Usage: `recall_context(query="...", resolution=0)`. Useful for "what did we discuss about X?" queries.
+
+**38. Post-compaction raw turn injection** - `session-start-compact.sh` now injects last 20 raw turns (truncated to 150 chars each) from the project, in addition to recovery buffer and topic-aware atoms. Provides "what were we doing?" context after compaction. Added between Priority 1 (recovery buffer) and Priority 2 (atom injection).
+
+**39. Static memory reminder** - `user-prompt-submit.sh` now outputs `Memory: recall_context available. Use /primeDB for full context load.` on every message where no signal-based injection triggers (short messages and no-signal messages). Keeps Claude aware the memory system exists after compaction.
+
+**40. File-system watcher (incremental sync)** - New `incremental-sync.js` script + `com.claude.memory-sync.plist` launchd agent. Watches `~/.claude/projects/` via launchd `WatchPaths` with 30-second throttle. Parses JSONL transcripts, inserts new turns with `embed_status='pending'`. Worker handles embedding asynchronously. Sync state tracked in `data/sync-state.json`. Enables cross-session recall of open/unfinished sessions. Initial sync: 6,169 new turns from 485 files.
+
+**41. Repeat events cleanup** - All 18 unresolved repeat events resolved. Atom #158 events (Chrome vs Electron) marked resolved (atom already archived, decision reversed). Atom #51 events (6 duplicate flags from single thread) marked resolved. Atoms #57, #62, #49, #55 reworded to be more prescriptive and confidence boosted to 0.90.
 
 ### Phase 3 Implementation Notes
 

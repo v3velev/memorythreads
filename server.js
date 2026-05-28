@@ -9,6 +9,9 @@ import { homedir } from "os";
 import { execFile, execFileSync } from "child_process";
 import { createHash } from "crypto";
 import { z } from "zod";
+import { get as httpsGet } from "https";
+import { get as httpGet } from "http";
+import { ensureCanonicalSchema, setActiveCanonicalThread } from "./memory-schema.js";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -89,11 +92,17 @@ function loadEnv() {
 
 loadEnv();
 
+// ── Mode Flags ───────────────────────────────────────────────────────────────
+// SQLITE_ONLY disables all OpenAI embedding calls AND blocks new atom writes.
+// Search falls back to BM25/FTS only; existing atoms remain readable.
+const SQLITE_ONLY = (process.env.SQLITE_ONLY || "").toLowerCase() === "true";
+
 // ── OpenAI Client ────────────────────────────────────────────────────────────
 
 let openaiClient = null;
 
 function getOpenAI() {
+  if (SQLITE_ONLY) return null;
   if (!openaiClient && process.env.OPENAI_API_KEY) {
     openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   }
@@ -145,6 +154,7 @@ function initDb() {
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
   db.pragma("busy_timeout = 5000");
+  ensureCanonicalSchema(db);
 
   // Archive tables (kept for backward compat)
   db.exec(`
@@ -1035,7 +1045,7 @@ server.tool(
   "Hybrid BM25+vector search. Supports OR operator and \"quoted phrases\". resolution: 0=raw turns, 3=atoms, 2=exchanges, 1=full threads.",
   {
     query: z.string().describe("Search topic or question"),
-    resolution: z.number().optional().default(3).describe("0=raw turns, 3=atoms, 2=exchanges, 1=threads"),
+    resolution: z.number().optional().default(0).describe("0=raw turns (default; atoms disabled in this install), 1=threads, 2=exchanges, 3=atoms (empty)"),
     project: z.string().optional().describe("Project filter ('*' for all)"),
     type: z.string().optional().describe("Knowledge type filter"),
     limit: z.number().optional().default(5).describe("Max results (default 5)"),
@@ -1055,7 +1065,7 @@ server.tool(
         return { content: [{ type: "text", text: formatted }] };
       }
 
-      const res = resolution || 3;
+      const res = resolution !== undefined ? resolution : 0;
 
       if (res === 3) {
         // Atom-level search
@@ -1161,9 +1171,9 @@ server.tool(
   }
 );
 
-// ── Tool 2: save_knowledge ──────────────────────────────────────────────────
+// ── Tool 2: save_knowledge ── DISABLED 2026-04-30 (atoms removed) ──────────
 
-server.tool(
+false && server.tool(
   "save_knowledge",
   "Save knowledge with auto-dedup. Include reasoning for decisions.",
   {
@@ -1174,6 +1184,9 @@ server.tool(
   },
   async ({ content, type, scope, project }) => {
     try {
+      if (SQLITE_ONLY) {
+        return { content: [{ type: "text", text: "Atom saving is disabled (SQLITE_ONLY mode). No embeddings or knowledge atoms will be written." }] };
+      }
       if (content.length < 15) {
         return { content: [{ type: "text", text: "Content too short (min 15 chars). Not saved." }] };
       }
@@ -1259,9 +1272,9 @@ server.tool(
   }
 );
 
-// ── Tool 3: memory_manage (merged feedback + admin + ingest) ────────────────
+// ── Tool 3: memory_manage ── DISABLED 2026-04-30 (atoms removed) ───────────
 
-server.tool(
+false && server.tool(
   "memory_manage",
   "Manage memory: feedback signals, admin operations, ingestion. Actions: feedback, batch_feedback, list, view, delete, edit, recent_extractions, reextract, archive_project, purge_archived, summary, stale, low_confidence, most_used, disk_usage, ingest_sessions.",
   {
@@ -1604,6 +1617,260 @@ server.tool(
     } catch (err) {
       return { content: [{ type: "text", text: `memory_manage error: ${err.message}` }], isError: true };
     }
+  }
+);
+
+// ── MemoryThreads: doc ingestion ────────────────────────────────────────────
+
+function fetchUrlMT(url) {
+  return new Promise((resolve, reject) => {
+    const getter = url.startsWith("https") ? httpsGet : httpGet;
+    getter(url, { headers: { "User-Agent": "memorythreads/1.0" } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        fetchUrlMT(res.headers.location).then(resolve).catch(reject);
+        return;
+      }
+      if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
+      let data = "";
+      res.on("data", c => data += c);
+      res.on("end", () => resolve(data));
+    }).on("error", reject);
+  });
+}
+
+server.tool(
+  "ingest_doc",
+  "Ingest a reference document (URL, llms.txt, or local file path) into MemoryThreads. Searchable via search_docs and recall_context.",
+  {
+    source: z.string().describe("URL or absolute file path"),
+    tags: z.string().optional().describe("Comma-separated tags"),
+    title: z.string().optional().describe("Override title (default: first H1 or basename)"),
+  },
+  async ({ source, tags, title }) => {
+    try {
+      let content;
+      if (source.startsWith("http://") || source.startsWith("https://")) {
+        content = await fetchUrlMT(source);
+      } else {
+        content = readFileSync(source, "utf-8");
+      }
+      const finalTitle = (title || (content.split("\n")[0] || "").trim().replace(/^#\s*/, "") || basename(source, ".md")).slice(0, 200);
+      const finalTags = tags || null;
+      const existing = db.prepare("SELECT id FROM docs WHERE source = ?").get(source);
+      let id;
+      if (existing) {
+        db.prepare("UPDATE docs SET title=?, content=?, tags=?, updated_at=datetime('now') WHERE id=?")
+          .run(finalTitle, content, finalTags, existing.id);
+        id = existing.id;
+      } else {
+        const r = db.prepare("INSERT INTO docs (title, content, tags, source) VALUES (?, ?, ?, ?)")
+          .run(finalTitle, content, finalTags, source);
+        id = Number(r.lastInsertRowid);
+      }
+      return { content: [{ type: "text", text: `Ingested doc #${id} "${finalTitle}" (${content.length} chars, tags: ${finalTags || "none"})` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `ingest_doc error: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "search_docs",
+  "FTS5 search over ingested MemoryThreads documentation. Supports AND/OR/NOT/'phrase'/prefix*",
+  { query: z.string(), limit: z.number().optional().default(10) },
+  async ({ query, limit }) => {
+    try {
+      const rows = db.prepare(`
+        SELECT d.id, d.title, d.tags, d.source, substr(d.content, 1, 300) AS preview
+        FROM docs_fts f JOIN docs d ON f.rowid = d.id
+        WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?
+      `).all(query, limit);
+      if (!rows.length) return { content: [{ type: "text", text: `No docs matching: ${query}` }] };
+      const out = rows.map(r => `[#${r.id}] ${r.title} ${r.tags ? `(${r.tags})` : ""}\n  ${r.preview.replace(/\n/g, " ")}...`).join("\n\n");
+      return { content: [{ type: "text", text: out }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `search_docs error: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "list_docs",
+  "List all ingested MemoryThreads docs with sizes and tags.",
+  {},
+  async () => {
+    const rows = db.prepare("SELECT id, title, tags, source, length(content) AS size, created_at FROM docs ORDER BY id").all();
+    if (!rows.length) return { content: [{ type: "text", text: "No docs in database." }] };
+    const out = rows.map(r => `[#${r.id}] ${r.title} | ${r.size} chars | tags: ${r.tags || "none"} | ${r.source}`).join("\n");
+    return { content: [{ type: "text", text: out }] };
+  }
+);
+
+server.tool(
+  "delete_doc",
+  "Delete an ingested doc by id.",
+  { id: z.number() },
+  async ({ id }) => {
+    const row = db.prepare("SELECT title FROM docs WHERE id = ?").get(id);
+    if (!row) return { content: [{ type: "text", text: `No doc with id=${id}` }] };
+    db.prepare("DELETE FROM docs WHERE id = ?").run(id);
+    return { content: [{ type: "text", text: `Deleted doc #${id} "${row.title}"` }] };
+  }
+);
+
+function projectHash(projectPath) {
+  return createHash("sha256").update(projectPath || "unknown").digest("hex").slice(0, 16);
+}
+
+function resolveThreadForSession(sessionId) {
+  if (!sessionId) return null;
+  return db.prepare(`
+    SELECT id, canonical_thread_id, source_kind, source_session_id
+    FROM threads
+    WHERE source_session_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(sessionId) || db.prepare(`
+    SELECT id, canonical_thread_id, source_kind, source_session_id
+    FROM threads
+    WHERE source_file LIKE ? OR source_file LIKE ?
+    ORDER BY created_at DESC
+    LIMIT 1
+  `).get(`%/${sessionId}.jsonl`, `%-${sessionId}.jsonl`) || null;
+}
+
+function ensurePlaceholderThread(threadId, sessionId, projectPath, sourceKind) {
+  const existing = db.prepare("SELECT id FROM threads WHERE id = ?").get(threadId);
+  if (existing) return;
+  const name = basename(projectPath || "unknown");
+  const project = projectHash(projectPath || "unknown");
+  db.prepare(`
+    INSERT OR IGNORE INTO threads
+      (id, project, project_name, turn_count, timestamp_start, timestamp_end, source_file, file_mtime, source_kind, source_session_id, canonical_thread_id)
+    VALUES (?, ?, ?, 0, NULL, NULL, ?, 0, ?, ?, ?)
+  `).run(
+    threadId,
+    project,
+    name,
+    `${projectPath || "unknown"}/${sessionId || threadId}.jsonl`,
+    sourceKind || "unknown",
+    sessionId || null,
+    threadId
+  );
+}
+
+// ── MemoryThreads: thread bookmarks ─────────────────────────────────────────
+
+server.tool(
+  "save_thread",
+  "Bookmark the current native session as a named MemoryThread.",
+  {
+    name: z.string().describe("Bookmark name (must be unique)"),
+    session_id: z.string().describe("Native session id or JSONL filename stem"),
+    project_path: z.string().describe("Project cwd"),
+    note: z.string().optional().describe("Optional free-text note"),
+    app: z.string().optional().describe("App name, usually claude or codex"),
+    source_kind: z.string().optional().describe("Source kind, usually claude or codex"),
+  },
+  async ({ name, session_id, project_path, note, app, source_kind }) => {
+    try {
+      const t = resolveThreadForSession(session_id);
+      const threadId = t?.canonical_thread_id || t?.id
+        || createHash("sha256").update(`${project_path || ""}\n${session_id}`).digest("hex").slice(0, 16);
+      ensurePlaceholderThread(threadId, session_id, project_path, source_kind || t?.source_kind || app || "unknown");
+      db.prepare(`
+        INSERT OR REPLACE INTO saved_threads (name, thread_id, session_id, project_path, note, saved_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
+      `).run(name, threadId, session_id, project_path, note || null);
+      if (app && project_path) {
+        setActiveCanonicalThread(db, {
+          app,
+          cwd: project_path,
+          canonicalThreadId: threadId,
+          savedName: name,
+          sourceSessionId: session_id,
+        });
+      }
+      return { content: [{ type: "text", text: `Saved MemoryThread "${name}" for session ${session_id} in ${project_path}. Canonical thread: ${threadId}` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `save_thread error: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "list_threads",
+  "List saved MemoryThread bookmarks ordered by last activity.",
+  {},
+  async () => {
+    const rows = db.prepare(`
+      SELECT s.name, s.thread_id, s.session_id, s.project_path, s.note, s.saved_at, s.last_resumed_at,
+             t.source_kind, t.source_session_id, t.canonical_thread_id, t.turn_count, t.timestamp_end
+      FROM saved_threads s
+      LEFT JOIN threads t ON t.id = s.thread_id
+      ORDER BY COALESCE(s.last_resumed_at, s.saved_at) DESC
+    `).all();
+    if (!rows.length) return { content: [{ type: "text", text: "No saved MemoryThreads. Use save_thread or `/mt-save <name>` to bookmark." }] };
+    const out = rows.map(r =>
+      `${r.name}\n  canonical: ${r.thread_id}\n  source: ${r.source_kind || "unknown"} ${r.source_session_id || r.session_id}\n  project: ${r.project_path}\n  turns: ${r.turn_count || 0}\n  saved: ${r.saved_at}${r.last_resumed_at ? ` | last resumed: ${r.last_resumed_at}` : ""}${r.note ? `\n  note: ${r.note}` : ""}`
+    ).join("\n\n");
+    return { content: [{ type: "text", text: out }] };
+  }
+);
+
+server.tool(
+  "activate_thread",
+  "Select a saved or canonical MemoryThread for autonomous hook context in this app and cwd.",
+  {
+    name_or_id: z.string().describe("Saved name or canonical thread id"),
+    app: z.string().optional().default("codex").describe("App name, usually codex or claude"),
+    cwd: z.string().describe("Project cwd where the thread should be active"),
+  },
+  async ({ name_or_id, app, cwd }) => {
+    try {
+      const saved = db.prepare(`
+        SELECT s.name, s.thread_id, s.session_id, t.canonical_thread_id
+        FROM saved_threads s
+        LEFT JOIN threads t ON t.id = s.thread_id
+        WHERE s.name = ?
+      `).get(name_or_id);
+      const direct = saved ? null : db.prepare(`
+        SELECT id, canonical_thread_id, source_session_id
+        FROM threads
+        WHERE id = ? OR canonical_thread_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+      `).get(name_or_id, name_or_id);
+      const canonicalThreadId = saved?.canonical_thread_id || saved?.thread_id || direct?.canonical_thread_id || direct?.id;
+      if (!canonicalThreadId) {
+        return { content: [{ type: "text", text: `No saved or canonical MemoryThread named "${name_or_id}"` }], isError: true };
+      }
+      setActiveCanonicalThread(db, {
+        app,
+        cwd,
+        canonicalThreadId,
+        savedName: saved?.name || null,
+        sourceSessionId: saved?.session_id || direct?.source_session_id || null,
+      });
+      if (saved?.name) {
+        db.prepare("UPDATE saved_threads SET last_resumed_at = datetime('now') WHERE name = ?").run(saved.name);
+      }
+      return { content: [{ type: "text", text: `Activated MemoryThread ${canonicalThreadId} for ${app} in ${cwd}.` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `activate_thread error: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "delete_thread",
+  "Delete a saved MemoryThread bookmark by name.",
+  { name: z.string() },
+  async ({ name }) => {
+    const row = db.prepare("SELECT name FROM saved_threads WHERE name = ?").get(name);
+    if (!row) return { content: [{ type: "text", text: `No saved MemoryThread named "${name}"` }] };
+    db.prepare("DELETE FROM saved_threads WHERE name = ?").run(name);
+    return { content: [{ type: "text", text: `Deleted MemoryThread "${name}"` }] };
   }
 );
 

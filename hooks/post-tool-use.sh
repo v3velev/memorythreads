@@ -3,6 +3,9 @@
 # Only acts on Read/Edit/Write tools for source files
 # Timeout: 500ms
 
+# ATOMS DISABLED 2026-04-30 - hook short-circuits since knowledge table is empty
+exit 0
+
 SERVER_DIR="$HOME/.claude/memory-server"
 DB_PATH="$SERVER_DIR/data/memory.db"
 

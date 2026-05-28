@@ -27,3 +27,6 @@ snapshots/
 
 # Test artifacts
 _test_transcript.jsonl
+
+# Atom-era archive snapshots (2.8GB of old DB copies + code) - never commit
+archive_atoms/

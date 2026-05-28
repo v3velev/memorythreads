@@ -2,6 +2,32 @@
 
 Schema version: **1** (as of 2026-03-08)
 
+## Canonical MemoryThreads columns
+
+The `threads` table now also stores native source tracking:
+
+```sql
+source_kind TEXT NOT NULL DEFAULT 'unknown',
+source_session_id TEXT,
+canonical_thread_id TEXT
+```
+
+`active_memory_threads` stores the currently selected canonical thread per app and cwd:
+
+```sql
+CREATE TABLE active_memory_threads (
+  app TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  canonical_thread_id TEXT NOT NULL,
+  saved_name TEXT,
+  source_session_id TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (app, cwd)
+);
+```
+
+Codex Desktop and Claude Code stay as separate native source streams. MemoryThreads continuity comes from `canonical_thread_id`, not from sharing native session files.
+
 ## knowledge table
 
 ```sql
