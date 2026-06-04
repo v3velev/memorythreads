@@ -69,6 +69,13 @@ db.prepare(`
   VALUES ('codex', '/tmp/project', 'thread-a', 'Client Test', 'codex-a')
 `).run();
 
+// Session-scoped active-thread resolution (getActiveForSession) reads the saved
+// name from saved_threads, so the bookmark must exist there for it to surface.
+db.prepare(`
+  INSERT INTO saved_threads (name, thread_id, session_id, project_path)
+  VALUES ('Client Test', 'thread-a', 'codex-a', '/tmp/project')
+`).run();
+
 db.prepare(`
   INSERT INTO turns (thread_id, turn_number, user_content, assistant_content, timestamp)
   VALUES ('thread-a', 1, 'User asked about autonomous memory.', 'Assistant proposed canonical threads.', '2026-05-05T10:00:00Z')

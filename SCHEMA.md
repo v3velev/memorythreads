@@ -1,18 +1,67 @@
 # Memory Server - Canonical Schema Reference
 
-Schema version: **1** (as of 2026-03-08)
+MemoryThreads stores conversation turns and threads from both Claude Code and Codex in one SQLite DB, searchable via FTS5 (BM25) and sqlite-vec (cosine). Recall operates directly over conversation turns and threads; there is no separate extracted-knowledge layer.
 
-## Canonical MemoryThreads columns
+## Core tables
 
-The `threads` table now also stores native source tracking:
+### threads
 
 ```sql
-source_kind TEXT NOT NULL DEFAULT 'unknown',
-source_session_id TEXT,
-canonical_thread_id TEXT
+CREATE TABLE threads (
+  id TEXT PRIMARY KEY,
+  project TEXT, project_name TEXT, turn_count INTEGER DEFAULT 0,
+  timestamp_start TEXT, timestamp_end TEXT,
+  priority TEXT DEFAULT 'routine',
+  has_corrections INTEGER DEFAULT 0, has_decisions INTEGER DEFAULT 0, has_debugging INTEGER DEFAULT 0,
+  source_file TEXT, file_mtime TEXT,
+  created_at DATETIME DEFAULT (datetime('now')),
+  source_kind TEXT NOT NULL DEFAULT 'unknown',   -- 'claude' | 'codex' | 'snapshot' | 'unknown'
+  source_session_id TEXT,                         -- native session id for that source
+  canonical_thread_id TEXT                        -- connects native streams to one MemoryThread
+);
 ```
 
-`active_memory_threads` stores the currently selected canonical thread per app and cwd:
+### turns
+
+```sql
+CREATE TABLE turns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  turn_number INTEGER NOT NULL,
+  user_content TEXT, assistant_content TEXT, timestamp TEXT,
+  is_key_exchange INTEGER DEFAULT 0, key_exchange_type TEXT,
+  tool_calls_count INTEGER DEFAULT 0, has_error INTEGER DEFAULT 0,
+  embed_status TEXT DEFAULT 'pending',            -- 'pending' until worker embeds it
+  user_uuid TEXT, assistant_uuid TEXT
+);
+```
+
+### turns_fts (FTS5, stemmed BM25 over turns)
+
+```sql
+CREATE VIRTUAL TABLE turns_fts USING fts5(
+  user_content, assistant_content,
+  content='turns', content_rowid='id',
+  tokenize='porter'
+);
+```
+
+Synced by the `turns_fts_ai/ad/au` triggers on the `turns` table.
+
+### turn_embeddings (sqlite-vec, cosine KNN over turns)
+
+```sql
+CREATE VIRTUAL TABLE turn_embeddings USING vec0(
+  turn_id INTEGER PRIMARY KEY,
+  embedding float[1536] distance_metric=cosine
+);
+```
+
+Populated by `worker.js` (OpenAI text-embedding-3-small, 1536 dims) for turns with `embed_status='pending'`. Requires the sqlite-vec extension to be loaded before any query/DDL against it.
+
+## Canonical MemoryThreads (cross-platform continuity)
+
+`active_memory_threads` stores the currently selected canonical thread per app and cwd. Codex Desktop and Claude Code stay as separate native source streams; continuity comes from `canonical_thread_id`, not from sharing native session files.
 
 ```sql
 CREATE TABLE active_memory_threads (
@@ -26,130 +75,62 @@ CREATE TABLE active_memory_threads (
 );
 ```
 
-Codex Desktop and Claude Code stay as separate native source streams. MemoryThreads continuity comes from `canonical_thread_id`, not from sharing native session files.
-
-## knowledge table
+## Supporting tables
 
 ```sql
-CREATE TABLE knowledge (
+CREATE TABLE saved_threads (        -- /mt-save bookmarks
+  name TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  session_id TEXT NOT NULL,
+  project_path TEXT, note TEXT,
+  saved_at TEXT DEFAULT CURRENT_TIMESTAMP, last_resumed_at TEXT
+);
+
+CREATE TABLE docs (                 -- ingest_doc / search_docs reference docs
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  content TEXT NOT NULL,
-  type TEXT NOT NULL CHECK(type IN (
-    'preference', 'decision', 'fact', 'pattern',
-    'architecture', 'tool_config', 'debugging',
-    'correction', 'reasoning_chain', 'workaround', 'anti_pattern',
-    'insight'
-  )),
-  scope TEXT NOT NULL DEFAULT 'project' CHECK(scope IN (
-    'project', 'global', 'cross_project'
-  )),
-  project TEXT,
-  scope_path TEXT,
-  tags TEXT,
-  concepts TEXT,
-  source_type TEXT CHECK(source_type IN (
-    'user_explicit', 'model_initiated', 'heuristic', 'llm_extracted'
-  )),
-  source_session TEXT,
-  source_thread_id TEXT,
-  confidence REAL NOT NULL DEFAULT 0.60,
-  reinforcement_count INTEGER NOT NULL DEFAULT 1,
-  decay_rate REAL NOT NULL DEFAULT 0.30,
-  last_accessed_at DATETIME,
-  injection_success_rate REAL,
-  metadata TEXT,                              -- JSON blob
-  status TEXT NOT NULL DEFAULT 'active' CHECK(status IN (
-    'active', 'superseded', 'archived'
-  )),
-  created_at DATETIME NOT NULL DEFAULT (datetime('now')),
-  updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
-  git_commit_hash TEXT,                       -- commit hash when atom was created
-  git_project_dir TEXT,                       -- repo path for git-aware staleness
-  access_count INTEGER NOT NULL DEFAULT 0,
-  impasse_severity REAL DEFAULT 0.0,          -- 0-1 severity for debugging impasses
-  last_reinforced_at DATETIME,
-  last_injected_at DATETIME,
-  contradiction_note TEXT,                    -- appended notes on conflicting info
-  superseded_by INTEGER REFERENCES knowledge(id),  -- points to replacement atom on merge/correction
-  git_staleness TEXT                          -- human-readable staleness description
+  title TEXT NOT NULL, content TEXT NOT NULL, tags TEXT,
+  source TEXT UNIQUE,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT
 );
-```
+-- docs_fts: FTS5 over docs (title, content)
 
-### Non-obvious columns
-
-- **superseded_by** - When atoms are merged or corrected, the old atom gets `status='superseded'` and `superseded_by` points to the replacement atom's id. Used in `worker.js` consolidation merges.
-- **git_staleness** - Set by `checkGitStaleness()` in worker.js when referenced files have changed significantly since atom creation. Human-readable string like `"utils.js changed 120 lines since abc12345"`.
-- **impasse_severity** - Float 0-1 set during extraction when a debugging impasse is detected. Higher values indicate more severe/costly impasses.
-- **contradiction_note** - Appended (not overwritten) with notes about conflicts, including git staleness annotations.
-
-### Indexes
-
-```sql
-CREATE INDEX idx_knowledge_scope_project ON knowledge(scope, project);
-CREATE INDEX idx_knowledge_type ON knowledge(type);
-CREATE INDEX idx_knowledge_status ON knowledge(status);
-CREATE INDEX idx_knowledge_confidence ON knowledge(confidence DESC) WHERE status = 'active';
-CREATE INDEX idx_knowledge_source_thread ON knowledge(source_thread_id);
-```
-
-## FTS Virtual Tables
-
-### knowledge_fts (stemmed - for recall/search)
-
-```sql
-CREATE VIRTUAL TABLE knowledge_fts USING fts5(
-  content, tags,
-  content='knowledge',
-  content_rowid='id',
-  tokenize='porter unicode61'
+CREATE TABLE tool_uses (            -- per-turn tool-call records
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_uuid TEXT NOT NULL,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  turn_id INTEGER REFERENCES turns(id),
+  tool_name TEXT NOT NULL, tool_input TEXT, timestamp TEXT,
+  has_error INTEGER DEFAULT 0
 );
-```
 
-### knowledge_fts_exact (unstemmed - for exact identifier matching)
-
-```sql
-CREATE VIRTUAL TABLE knowledge_fts_exact USING fts5(
-  content, tags,
-  content='knowledge',
-  content_rowid='id',
-  tokenize='unicode61'
+CREATE TABLE summaries (            -- thread summaries
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL REFERENCES threads(id),
+  leaf_uuid TEXT, summary TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
-```
 
-## FTS Triggers
+CREATE TABLE recovery_buffer (      -- pre-compact snapshots, surfaced by user-prompt-submit hook
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT, project TEXT, content TEXT NOT NULL,
+  created_at DATETIME DEFAULT (datetime('now'))
+);
 
-All three triggers sync both `knowledge_fts` and `knowledge_fts_exact`, including the `tags` column.
-
-```sql
-CREATE TRIGGER knowledge_fts_ai AFTER INSERT ON knowledge BEGIN
-  INSERT INTO knowledge_fts(rowid, content, tags)
-  VALUES (new.id, new.content, COALESCE(new.tags,''));
-  INSERT INTO knowledge_fts_exact(rowid, content, tags)
-  VALUES (new.id, new.content, COALESCE(new.tags,''));
-END;
-
-CREATE TRIGGER knowledge_fts_ad AFTER DELETE ON knowledge BEGIN
-  INSERT INTO knowledge_fts(knowledge_fts, rowid, content, tags)
-  VALUES ('delete', old.id, old.content, COALESCE(old.tags,''));
-  INSERT INTO knowledge_fts_exact(knowledge_fts_exact, rowid, content, tags)
-  VALUES ('delete', old.id, old.content, COALESCE(old.tags,''));
-END;
-
-CREATE TRIGGER knowledge_fts_au AFTER UPDATE ON knowledge BEGIN
-  INSERT INTO knowledge_fts(knowledge_fts, rowid, content, tags)
-  VALUES ('delete', old.id, old.content, COALESCE(old.tags,''));
-  INSERT INTO knowledge_fts(rowid, content, tags)
-  VALUES (new.id, new.content, COALESCE(new.tags,''));
-  INSERT INTO knowledge_fts_exact(knowledge_fts_exact, rowid, content, tags)
-  VALUES ('delete', old.id, old.content, COALESCE(old.tags,''));
-  INSERT INTO knowledge_fts_exact(rowid, content, tags)
-  VALUES (new.id, new.content, COALESCE(new.tags,''));
-END;
+CREATE TABLE jobs (                 -- worker ingestion queue
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL DEFAULT 'ingest_thread',
+  session_file TEXT, payload TEXT, project TEXT, project_name TEXT,
+  status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 0,
+  attempts INTEGER DEFAULT 0, error TEXT,
+  created_at DATETIME DEFAULT (datetime('now')),
+  started_at DATETIME, completed_at DATETIME
+);
 ```
 
 ## Migration Notes
 
-- SQLite cannot ALTER CHECK constraints - must rebuild table (rename old, create new, copy data, drop old)
-- Always `PRAGMA foreign_keys = OFF` before table rebuild, re-enable after
-- After rebuild: recreate all indexes and FTS triggers
-- After FTS virtual table changes: run `INSERT INTO <fts_table>(<fts_table>) VALUES('rebuild')` to reindex
+- Migrations are manual one-shot `.cjs` scripts in `migrations/`; nothing runs them automatically on boot. The live schema is ensured by `ensureCanonicalSchema()` in `memory-schema.js`.
+- SQLite cannot ALTER CHECK constraints - rebuild the table (rename old, create new, copy data, drop old).
+- Always `PRAGMA foreign_keys = OFF` before a table rebuild, re-enable after.
+- After FTS virtual-table changes: `INSERT INTO <fts_table>(<fts_table>) VALUES('rebuild')` to reindex.
+- The sqlite-vec virtual table (`turn_embeddings`) can only be created/dropped from a process that has loaded the sqlite-vec extension (the plain `sqlite3` CLI cannot).

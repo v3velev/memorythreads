@@ -20,11 +20,6 @@
 - `projectName` is human-readable - used for semantic search/embeddings
 - Never embed the project hash for semantic search (garbage similarity scores)
 
-## Atom Creation
-- Auto-extraction is DISABLED (Phase 6, 2026-03-16). `SKIP_AUTO_EXTRACTION = true` in worker.js.
-- Atoms are only created via explicit `save_knowledge` MCP tool calls, approved by the user.
-- To re-enable auto-extraction: set `SKIP_AUTO_EXTRACTION = false` in worker.js line ~848, and change `if (false && job.type === "ingest_thread")` back to `if (job.type === "ingest_thread")` in handleJob line ~1974.
-
 ## Incremental Sync
 - `incremental-sync.js` runs via launchd WatchPaths (30s throttle) on `~/.claude/projects/`
 - Sync state persisted in `data/sync-state.json`
@@ -43,7 +38,6 @@
 - User prompt and compaction hooks must never emit recovery headers without actual recovered content
 
 ## recall_context Resolution Levels
-- `resolution=0`: Raw individual turns (not grouped), ranked by BM25+vector
-- `resolution=3` (default): Knowledge atoms, hybrid search
+- `resolution=0` (default): Raw individual turns (not grouped), ranked by BM25+vector
 - `resolution=2`: Thread-level key exchanges
 - `resolution=1`: Full thread content with intelligent truncation

@@ -105,7 +105,7 @@ Verify: `sqlite3 ~/.claude/memory-server/data/memory.db ".tables"` should show ~
 claude mcp add --scope user memory node ~/.claude/memory-server/server.js
 ```
 
-This makes three MCP tools available in all Claude Code sessions: `recall_context`, `save_knowledge`, `memory_manage`.
+This makes the MemoryThreads MCP tools available in all sessions: `recall_context`, `search_docs`, `ingest_doc`, `list_docs`, `delete_doc`, and the thread bookmark tools (`save_thread`, `list_threads`, `activate_thread`, `delete_thread`).
 
 Verify: `claude mcp get memory` returns the server config.
 
@@ -160,17 +160,6 @@ Merge the following `hooks` block into `~/.claude/settings.json`. If the file al
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$HOME/.claude/memory-server/hooks/post-tool-use.sh",
-            "timeout": 500
-          }
-        ]
-      }
-    ],
     "UserPromptSubmit": [
       {
         "hooks": [
@@ -196,7 +185,7 @@ chmod +x ~/.claude/memory-server/hooks/*.sh
 which node > ~/.claude/memory-server/.node-path
 ```
 
-Verify: `cat ~/.claude/settings.json | jq '.hooks | keys'` should list all 5 hook types.
+Verify: `cat ~/.claude/settings.json | jq '.hooks | keys'` should list all 4 hook types.
 
 ## 6. Watchdog (macOS - launchd)
 
@@ -312,32 +301,14 @@ Verify: `launchctl list | grep claude` should show both `com.claude.memory-sync`
 
 ## 8. Global CLAUDE.md Setup
 
-Add the following to `~/.claude/CLAUDE.md` so memory slash commands and the user-approved atom workflow work in all sessions:
+Add a memory block to `~/.claude/CLAUDE.md` (and `~/.codex/AGENTS.md` for Codex) so memory is used in all sessions:
 
 ```markdown
-## Memory
-- Before asking the user to re-explain something, call recall_context first
-- If retrieved knowledge seems wrong or outdated, call memory_manage(action='feedback') with the correction
-- Auto-extraction is DISABLED. Do NOT call save_knowledge without user approval.
-- When you identify something worth remembering (a user preference, a decision, a correction, a behavioral pattern), append it to the END of your response like this:
-  ---
-  Memory: [brief description of what to save]
-  Type: [preference/decision/correction/insight]
-  Save? (y/n)
-- Only propose saving things that are DURABLE (won't be stale in 2 weeks), NOT derivable from code, and would CHANGE future behavior. Do not propose saving in-progress decisions, architecture choices that might change, or facts about current implementation state.
-- When the user approves, call save_knowledge with the content.
-
-## Memory Commands
-- /primeDB: Call recall_context(resolution=3) for atom overview. Summarize findings.
-  Expand relevant threads via recall_context(expand=thread_id). Don't dump raw results.
-- /saveDB: Review session for decisions/bugs/patterns/preferences/corrections.
-  List planned saves (type + summary, max 5). Wait for user approval before saving.
-  Decisions must include reasoning+alternatives. Anti-patterns: "Don't X because Y. Instead Z."
-  Check existing atoms for contradictions first; use memory_manage(action='feedback') to correct if found.
-- /reviewDB: Call memory_manage(action='recent_extractions', limit=10). Present atoms.
-  Ask for feedback. Also check memory_manage(action='low_confidence').
-- /forgetDB [topic]: recall_context the topic at resolution=3. Present matches.
-  Confirm before calling memory_manage(action='delete') on each.
+## Memory (MemoryThreads)
+- Conversation turns are auto-saved to SQLite and searchable across all past sessions (both Claude Code and Codex).
+- Before guessing or asking the user about an unfamiliar term, file, project, or past decision, call `recall_context(query, include_threads=true)` first.
+- `search_docs(query)` searches ingested reference docs.
+- Bookmark the current session with `/mt-save <name>`; list and resume bookmarks with `mt launch`.
 ```
 
 ## 9. Verification Checklist
@@ -367,6 +338,4 @@ Run each of these to confirm everything works:
 | launchd not starting watchdog | Check paths in plist are absolute (no `$HOME`), run `launchctl list | grep memory` |
 | Incremental sync not running | Check `logs/sync.log` and `logs/sync-stderr.log`. Verify plist loaded: `launchctl list | grep sync` |
 | Sync finds 0 new turns | Check `data/sync-state.json` - if mtimes are current, files haven't changed since last sync |
-| resolution=0 returns atoms instead | MCP server needs restart (loaded at session start). Start a new session. |
-| Migrations fail | Ensure `data/` directory exists, check Node.js version. If partially applied, delete `data/memory.db` and re-run all from 001 |
-| Want to re-enable auto-extraction | In `worker.js`, change `SKIP_AUTO_EXTRACTION = true` to `false` (line ~848). Also un-comment the hindsight extraction queue in `handleJob` (line ~1974). |
+| Schema looks wrong on a fresh DB | The live schema is created by `ensureCanonicalSchema()` in `memory-schema.js` (not the manual `migrations/` scripts, which are historical and not auto-run) |
