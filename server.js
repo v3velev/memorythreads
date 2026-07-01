@@ -17,7 +17,7 @@ import { ensureCanonicalSchema, setActiveCanonicalThread } from "./memory-schema
 
 const HOME = homedir();
 const SERVER_DIR = join(HOME, ".claude", "memory-server");
-const DB_PATH = join(SERVER_DIR, "data", "memory.db");
+const DB_PATH = process.env.MEMORY_DB_PATH || join(SERVER_DIR, "data", "memory.db");
 const PROJECTS_DIR = join(HOME, ".claude", "projects");
 const SNAPSHOTS_DIR = join(SERVER_DIR, "snapshots");
 const WORKER_PID_FILE = join(SERVER_DIR, "worker.pid");

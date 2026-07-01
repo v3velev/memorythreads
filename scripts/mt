@@ -14,6 +14,9 @@ case "$1" in
   browse)
     exec node "$SCRIPT_DIR/mt-browse.cjs"
     ;;
+  doctor)
+    exec node "$SCRIPT_DIR/doctor.cjs"
+    ;;
   status)
     sqlite3 "$DB_PATH" "
       SELECT 'turns          ' || COUNT(*) FROM turns
@@ -40,6 +43,7 @@ case "$1" in
     echo "  launch tmux   Same picker, but opens the thread INSIDE tmux (live + joinable from phone)"
     echo "  browse        TUI to browse ALL threads (sortable, filterable by project)"
     echo "  status        DB stats, worker status, recent activity"
+    echo "  doctor        Full health check (worker, backlog, wiring, embeddings)"
     echo "  help          Show this help"
     ;;
   *)

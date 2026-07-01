@@ -1,5 +1,7 @@
 # MemoryThreads
 
+[![CI](https://github.com/v3velev/memorythreads/actions/workflows/ci.yml/badge.svg)](https://github.com/v3velev/memorythreads/actions/workflows/ci.yml)
+
 **Persistent, searchable conversation memory shared across Claude Code and Codex.**
 
 MemoryThreads is a local MCP server that auto-captures every conversation turn from both Claude Code and OpenAI Codex into one SQLite database, then makes that history instantly searchable from any future session - hybrid BM25 (FTS5) + vector (sqlite-vec) recall, with cross-platform thread continuity. Start work in Claude Code, continue it in Codex, and either side can recall the full shared history.
@@ -90,7 +92,10 @@ LLM coding sessions are stateless - close the terminal and the context is gone. 
 ### Slash commands & CLI
 
 - `/mt-save <name>`, `/mt-list`, `/mt-delete <name>`, `/mt-doc-ingest <source>`
-- `mt launch` (terminal) - interactive picker to resume a saved thread.
+- `mt launch` - interactive picker to resume a saved thread (`mt launch tmux` for a tmux session)
+- `mt browse` - TUI to browse/filter all threads
+- `mt status` - DB stats, worker status, recent activity
+- `mt doctor` - full health check (worker, job backlog, embeddings, hooks + MCP wiring). Run this if memory seems stale - it surfaces silent failures. The session-start hook also warns automatically if the ingest backlog gets stuck.
 
 ---
 

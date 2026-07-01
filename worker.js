@@ -25,7 +25,7 @@ import {
 
 const HOME = homedir();
 const SERVER_DIR = join(HOME, ".claude", "memory-server");
-const DB_PATH = join(SERVER_DIR, "data", "memory.db");
+const DB_PATH = process.env.MEMORY_DB_PATH || join(SERVER_DIR, "data", "memory.db");
 const PID_FILE = join(SERVER_DIR, "worker.pid");
 const LOG_FILE = join(SERVER_DIR, "logs", "worker.log");
 const SNAPSHOTS_DIR = join(SERVER_DIR, "snapshots");

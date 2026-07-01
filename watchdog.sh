@@ -36,8 +36,10 @@ fi
 
 if [ -f "$PIDFILE" ]; then
   PID=$(cat "$PIDFILE")
-  # Verify PID is alive AND is actually a Node.js process (prevents PID recycling false positives)
-  if kill -0 "$PID" 2>/dev/null && ps -p "$PID" -o comm= 2>/dev/null | grep -q node; then
+  # Verify PID is alive AND is actually running worker.js. Checking the full
+  # command (not just comm=node) prevents PID-recycling false positives where the
+  # old worker died and its PID was reused by an unrelated node process.
+  if kill -0 "$PID" 2>/dev/null && ps -p "$PID" -o command= 2>/dev/null | grep -q "worker.js"; then
     # Worker is alive - reset failure counter
     echo "0" > "$FAILURE_FILE"
     exit 0

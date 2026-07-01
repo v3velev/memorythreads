@@ -7,6 +7,10 @@
   "bin": {
     "mt": "scripts/mt"
   },
+  "scripts": {
+    "test": "node tests/schema.test.js && node tests/transcript-parser.test.js && node tests/hook-context.test.js && node tests/integration.test.js",
+    "doctor": "node scripts/doctor.cjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/v3velev/memorythreads.git"
