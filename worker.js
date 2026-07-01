@@ -369,6 +369,7 @@ async function ingestThread(db, filePath, project, projectName, isFullSession, g
   }
 
   if (activeCwd) {
+    const active = getActiveCanonicalThread(db, app, activeCwd);
     setActiveCanonicalThread(db, {
       app,
       cwd: activeCwd,
