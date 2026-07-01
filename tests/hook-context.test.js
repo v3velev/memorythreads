@@ -12,50 +12,9 @@ const { buildMemoryContext } = require("../hooks/user-prompt-submit.cjs");
 const dbPath = join(mkdtempSync(join(tmpdir(), "mt-hook-")), "memory.db");
 const db = new Database(dbPath);
 
-db.exec(`
-  CREATE TABLE threads (
-    id TEXT PRIMARY KEY,
-    project TEXT,
-    project_name TEXT,
-    turn_count INTEGER DEFAULT 0,
-    timestamp_start TEXT,
-    timestamp_end TEXT,
-    source_file TEXT,
-    file_mtime TEXT,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE turns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL REFERENCES threads(id),
-    turn_number INTEGER NOT NULL,
-    user_content TEXT,
-    assistant_content TEXT,
-    timestamp TEXT,
-    tool_calls_count INTEGER DEFAULT 0,
-    has_error INTEGER DEFAULT 0,
-    embed_status TEXT DEFAULT 'done'
-  );
-
-  CREATE TABLE recovery_buffer (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT,
-    project TEXT,
-    content TEXT NOT NULL,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE saved_threads (
-    name TEXT PRIMARY KEY,
-    thread_id TEXT NOT NULL REFERENCES threads(id),
-    session_id TEXT NOT NULL,
-    project_path TEXT,
-    note TEXT,
-    saved_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    last_resumed_at TEXT
-  );
-`);
-
+// ensureCanonicalSchema builds the full schema (threads, turns, recovery_buffer,
+// saved_threads, active_memory_threads, ...) on this fresh DB. sqlite-vec isn't
+// loaded here, so the vec0 turn_embeddings table is skipped - not needed for this test.
 ensureCanonicalSchema(db);
 
 db.prepare(`

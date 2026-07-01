@@ -1,15 +1,13 @@
 # Memory Server - Development Rules
 
 ## Schema
-- Schema changes MUST update `SCHEMA.md` and increment `schema_version`
-- SQLite CHECK constraint changes require table rebuild (see `migrate-check-constraints.cjs` pattern)
-- After any migration: verify with `PRAGMA table_info`, test INSERTs for each status value, test FTS queries
+- The live schema is defined by `ensureCanonicalSchema()` in `memory-schema.js` and created automatically on first server/worker start. Update it there, and keep `SCHEMA.md` in sync.
+- SQLite cannot ALTER a CHECK constraint - rebuild the table (rename old, create new, copy, drop old) with `PRAGMA foreign_keys = OFF` around it.
+- After a schema change: verify with `PRAGMA table_info`, test INSERTs, and test FTS queries.
 
-## Migration Scripts
-- Use `.cjs` extension (package.json has `"type": "module"`)
-- Always back up DB before destructive migrations
-- Follow pattern: backup -> count -> rebuild -> verify count -> drop old -> reindex
-- FTS content-sync rebuild must happen OUTSIDE the table-rebuild transaction
+## Schema Changes / Migrations
+- There is no auto-run migration system; `ensureCanonicalSchema()` is the source of truth. Any one-off data migration should be a standalone `.cjs` script (package.json has `"type": "module"`), run manually, with a DB backup taken first.
+- FTS content-sync rebuild must happen OUTSIDE the table-rebuild transaction: `INSERT INTO <fts>(<fts>) VALUES('rebuild')`.
 
 ## FTS
 - Triggers must include ALL columns of the FTS virtual table (content AND tags)

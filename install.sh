@@ -116,6 +116,17 @@ say "Installing slash commands"
 mkdir -p "$HOME/.claude/commands"
 cp -f commands/*.md "$HOME/.claude/commands/" 2>/dev/null && ok "/mt-* commands -> ~/.claude/commands/" || warn "no commands/ dir to copy"
 
+# ── 6b. mt CLI ───────────────────────────────────────────────────────────────
+say "Installing the mt CLI"
+chmod +x "$TARGET/scripts/mt"
+BIN_DIR="$HOME/.local/bin"; mkdir -p "$BIN_DIR"
+ln -sf "$TARGET/scripts/mt" "$BIN_DIR/mt"
+if echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
+  ok "mt -> $BIN_DIR/mt (on PATH)"
+else
+  warn "mt installed to $BIN_DIR/mt - add to PATH: echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+fi
+
 # ── 7. CLAUDE.md / AGENTS.md memory block (idempotent, marker-bounded) ───────
 say "Adding memory instructions to CLAUDE.md / AGENTS.md"
 MEM_BLOCK='<!-- memorythreads:start -->

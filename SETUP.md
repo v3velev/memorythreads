@@ -55,49 +55,15 @@ Verify: `cat ~/.claude/memory-server/.env` shows your key. Run `which claude` an
 
 ## 3. Database Initialization
 
-Create required directories:
+Create the required directories:
 
 ```bash
 mkdir -p ~/.claude/memory-server/{data,logs,snapshots,seen}
 ```
 
-Run each migration in order. These must only be run once on a fresh install - do NOT re-run if they have already succeeded (migrations 002-004 will fail on a second run).
+There are no manual migrations to run. The database and its full schema are created automatically by `ensureCanonicalSchema()` (in `memory-schema.js`) the first time the server or worker starts. `install.sh` does the directory creation for you.
 
-If any migration fails partway through, delete `data/memory.db` and start from 001 again.
-
-```bash
-node ~/.claude/memory-server/migrations/001-initial.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/002-add-insight-type.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/003-check-constraints.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/004-fix-injection-fk.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/005-fts-exact.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/006-gating-and-git.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/007-schema-fix.cjs
-```
-
-```bash
-node ~/.claude/memory-server/migrations/008-canonical-memorythreads.cjs
-```
-
-Verify: `sqlite3 ~/.claude/memory-server/data/memory.db ".tables"` should show ~40 tables (including FTS virtual tables). If any migration printed errors, delete the database and re-run all migrations from 001.
+Verify (after the worker/server has started once): `sqlite3 ~/.claude/memory-server/data/memory.db ".tables"` should list the core tables - `threads`, `turns`, `turns_fts`, `turn_embeddings`, `docs`, `saved_threads`, `active_memory_threads`, `tool_uses`, `summaries`, `recovery_buffer`, `jobs`.
 
 ## 4. Register MCP Server
 

@@ -9,7 +9,133 @@ function addColumn(db, tableName, columnName, ddl) {
   }
 }
 
+// Create the full core schema on a fresh database (idempotent). This is the
+// single source of truth for the live schema - there is no migration runner.
+// sqlite-vec must be loaded before calling (server.js/worker.js do this).
+export function ensureBaseSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS threads (
+      id TEXT PRIMARY KEY,
+      project TEXT, project_name TEXT, turn_count INTEGER DEFAULT 0,
+      timestamp_start TEXT, timestamp_end TEXT,
+      priority TEXT DEFAULT 'routine',
+      has_corrections INTEGER DEFAULT 0, has_decisions INTEGER DEFAULT 0, has_debugging INTEGER DEFAULT 0,
+      source_file TEXT, file_mtime TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      source_kind TEXT NOT NULL DEFAULT 'unknown', source_session_id TEXT, canonical_thread_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS turns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id TEXT NOT NULL REFERENCES threads(id),
+      turn_number INTEGER NOT NULL,
+      user_content TEXT, assistant_content TEXT, timestamp TEXT,
+      is_key_exchange INTEGER DEFAULT 0, key_exchange_type TEXT,
+      tool_calls_count INTEGER DEFAULT 0, has_error INTEGER DEFAULT 0,
+      embed_status TEXT DEFAULT 'pending',
+      user_uuid TEXT, assistant_uuid TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_thread_turn ON turns(thread_id, turn_number);
+    CREATE INDEX IF NOT EXISTS idx_turns_user_uuid ON turns(user_uuid) WHERE user_uuid IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_turns_assistant_uuid ON turns(assistant_uuid) WHERE assistant_uuid IS NOT NULL;
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS turns_fts USING fts5(
+      user_content, assistant_content,
+      content='turns', content_rowid='id', tokenize='porter'
+    );
+    CREATE TRIGGER IF NOT EXISTS turns_fts_ai AFTER INSERT ON turns BEGIN
+      INSERT INTO turns_fts(rowid, user_content, assistant_content) VALUES (new.id, new.user_content, new.assistant_content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS turns_fts_ad AFTER DELETE ON turns BEGIN
+      INSERT INTO turns_fts(turns_fts, rowid, user_content, assistant_content) VALUES('delete', old.id, old.user_content, old.assistant_content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS turns_fts_au AFTER UPDATE ON turns BEGIN
+      INSERT INTO turns_fts(turns_fts, rowid, user_content, assistant_content) VALUES('delete', old.id, old.user_content, old.assistant_content);
+      INSERT INTO turns_fts(rowid, user_content, assistant_content) VALUES (new.id, new.user_content, new.assistant_content);
+    END;
+
+    CREATE TABLE IF NOT EXISTS docs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT NOT NULL, content TEXT NOT NULL, tags TEXT,
+      source TEXT UNIQUE,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+      title, content, tags, content=docs, content_rowid=id
+    );
+    CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON docs BEGIN
+      INSERT INTO docs_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS docs_ad AFTER DELETE ON docs BEGIN
+      INSERT INTO docs_fts(docs_fts, rowid, title, content, tags) VALUES('delete', old.id, old.title, old.content, old.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS docs_au AFTER UPDATE ON docs BEGIN
+      INSERT INTO docs_fts(docs_fts, rowid, title, content, tags) VALUES('delete', old.id, old.title, old.content, old.tags);
+      INSERT INTO docs_fts(rowid, title, content, tags) VALUES (new.id, new.title, new.content, new.tags);
+    END;
+
+    CREATE TABLE IF NOT EXISTS saved_threads (
+      name TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL REFERENCES threads(id),
+      session_id TEXT NOT NULL,
+      project_path TEXT, note TEXT,
+      saved_at TEXT DEFAULT CURRENT_TIMESTAMP, last_resumed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS tool_uses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      message_uuid TEXT NOT NULL,
+      thread_id TEXT NOT NULL REFERENCES threads(id),
+      turn_id INTEGER REFERENCES turns(id),
+      tool_name TEXT NOT NULL, tool_input TEXT, timestamp TEXT,
+      has_error INTEGER DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_uses_dedup ON tool_uses(message_uuid, tool_name, tool_input);
+    CREATE INDEX IF NOT EXISTS idx_tool_uses_thread ON tool_uses(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_tool_uses_tool ON tool_uses(tool_name);
+    CREATE INDEX IF NOT EXISTS idx_tool_uses_uuid ON tool_uses(message_uuid);
+
+    CREATE TABLE IF NOT EXISTS summaries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id TEXT NOT NULL REFERENCES threads(id),
+      leaf_uuid TEXT, summary TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_summaries_thread ON summaries(thread_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_summaries_leaf ON summaries(leaf_uuid) WHERE leaf_uuid IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS recovery_buffer (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT, project TEXT, content TEXT NOT NULL,
+      created_at DATETIME DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL DEFAULT 'ingest_thread',
+      session_file TEXT, payload TEXT, project TEXT, project_name TEXT,
+      status TEXT DEFAULT 'pending', priority INTEGER DEFAULT 0,
+      attempts INTEGER DEFAULT 0, error TEXT,
+      created_at DATETIME DEFAULT (datetime('now')),
+      started_at DATETIME, completed_at DATETIME
+    );
+
+    CREATE TABLE IF NOT EXISTS stats_daily (
+      date TEXT NOT NULL, metric TEXT NOT NULL, value REAL,
+      PRIMARY KEY (date, metric)
+    );
+  `);
+
+  // turn_embeddings is a vec0 virtual table needing the sqlite-vec extension.
+  // server.js/worker.js load it before calling; skip gracefully if absent (e.g.
+  // unit tests) so the rest of the schema still builds.
+  try {
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS turn_embeddings USING vec0(turn_id INTEGER PRIMARY KEY, embedding float[1536] distance_metric=cosine);`);
+  } catch { /* sqlite-vec not loaded */ }
+}
+
 export function ensureCanonicalSchema(db) {
+  ensureBaseSchema(db);
   addColumn(db, "threads", "source_kind", "source_kind TEXT NOT NULL DEFAULT 'unknown'");
   addColumn(db, "threads", "source_session_id", "source_session_id TEXT");
   addColumn(db, "threads", "canonical_thread_id", "canonical_thread_id TEXT");

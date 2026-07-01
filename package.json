@@ -1,13 +1,22 @@
 {
-  "name": "claude-memory-server",
-  "version": "1.0.0",
-  "description": "MCP server providing persistent searchable memory across Claude Code sessions",
+  "name": "memorythreads",
+  "version": "2.0.0",
+  "description": "MCP server providing persistent, searchable conversation memory shared across Claude Code and Codex (SQLite + FTS5 + sqlite-vec).",
   "type": "module",
   "main": "server.js",
+  "bin": {
+    "mt": "scripts/mt"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/v3velev/memorythreads.git"
+  },
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "better-sqlite3": "^11.8.1",
     "openai": "^6.27.0",
-    "sqlite-vec": "^0.1.7-alpha.2"
+    "sqlite-vec": "^0.1.7-alpha.2",
+    "zod": "^4.3.6"
   }
 }
