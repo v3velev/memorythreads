@@ -8,6 +8,48 @@ No cloud, no account - everything lives in `~/.claude/memory-server/` on your ma
 
 ---
 
+## Install (one command)
+
+**Prerequisites:** Node.js 18.18+, and an OpenAI API key (used only for local embeddings).
+
+```bash
+git clone https://github.com/v3velev/memorythreads ~/.claude/memory-server
+cd ~/.claude/memory-server && ./install.sh
+```
+
+The installer prompts for your OpenAI key (or reads `OPENAI_API_KEY` from your env), then does everything:
+
+- installs npm dependencies and writes `.env`
+- registers the `memory` MCP server for **Claude Code** (`claude mcp add`) and **Codex** (`~/.codex/config.toml`)
+- installs the capture/recall **hooks** into `~/.claude/settings.json` and `~/.codex/hooks.json`
+- installs the `/mt-*` **slash commands**
+- adds the **Memory block to your `~/.claude/CLAUDE.md`** (and `~/.codex/AGENTS.md`) so your agent uses recall automatically
+- starts the **background worker** (launchd on macOS) that parses + embeds transcripts
+
+It is idempotent - safe to re-run. After it finishes, restart Claude Code / Codex.
+
+### Install with your AI agent
+
+You can also just hand the repo to your own Claude Code and let it install itself. Paste this:
+
+> Install the MemoryThreads memory server from https://github.com/v3velev/memorythreads - clone it to `~/.claude/memory-server`, run `./install.sh`, and give it my OpenAI API key when it asks. Then restart so the MCP server and hooks load.
+
+### What gets added to your CLAUDE.md
+
+The installer inserts this block (between `<!-- memorythreads:start/end -->` markers, so re-running never duplicates it):
+
+```markdown
+## Memory (MemoryThreads)
+- Conversation turns are auto-saved to SQLite and searchable across all past sessions (both Claude Code and Codex).
+- Before guessing or asking the user about an unfamiliar term, file, project, or past decision, call `recall_context(query, include_threads=true)` first.
+- `search_docs(query)` searches ingested reference docs.
+- Bookmark the current session with `/mt-save <name>`; list and resume bookmarks with `mt launch`.
+```
+
+Full manual steps and Linux notes are in [SETUP.md](SETUP.md).
+
+---
+
 ## Why
 
 LLM coding sessions are stateless - close the terminal and the context is gone. MemoryThreads fixes that:
